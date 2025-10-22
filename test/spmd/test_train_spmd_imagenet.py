@@ -375,8 +375,11 @@ def train_imagenet():
       summary_writer=writer)
   loss_fn = nn.CrossEntropyLoss()
 
+  # Create tracker once for the entire training run (not per epoch)
+  tracker = xm.RateTracker()
+
   def train_loop_fn(loader, epoch):
-    tracker = xm.RateTracker()
+    # tracker = xm.RateTracker() # Moved outside to track over entire training; user this for per-epoch comparisons if needed
     model.train()
     for step, (data, target) in enumerate(loader):
       x = data.to(xm.xla_device())
