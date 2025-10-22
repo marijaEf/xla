@@ -64,6 +64,8 @@ FLAGS = args_parse.parse_common_options(
 )
 
 import os
+import sys
+import atexit
 import schedulers
 import numpy as np
 from functools import partial
@@ -147,6 +149,33 @@ def _train_update(device, step, loss, tracker, epoch, writer):
       tracker.global_rate(),
       epoch,
       summary_writer=writer)
+
+
+def _cleanup_dataloaders(*loaders):
+  """Clean up DataLoader workers to prevent exit errors."""
+  for loader in loaders:
+    if loader is None:
+      continue
+    try:
+      # Handle MpDeviceLoader that wraps a DataLoader
+      if hasattr(loader, '_loader'):
+        actual_loader = loader._loader
+      else:
+        actual_loader = loader
+      
+      # Clean up workers if they exist
+      if hasattr(actual_loader, '_workers') and actual_loader._workers:
+        for worker in actual_loader._workers:
+          if worker is not None and worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=1.0)
+      
+      # Also try to shutdown the loader if it has a shutdown method
+      if hasattr(actual_loader, '_shutdown_workers'):
+        actual_loader._shutdown_workers()
+    except Exception as e:
+      # Ignore cleanup errors to avoid masking the main error
+      pass
 
 
 def train_imagenet():
@@ -378,6 +407,10 @@ def train_imagenet():
 
   test_utils.close_summary_writer(writer)
   xm.master_print('Max Accuracy: {:.2f}%'.format(max_accuracy))
+  
+  # Clean up DataLoader workers to prevent exit errors
+  _cleanup_dataloaders(train_loader, test_loader)
+  
   return max_accuracy
 
 
