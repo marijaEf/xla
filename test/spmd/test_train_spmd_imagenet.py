@@ -75,6 +75,7 @@ FLAGS = args_parse.parse_common_options(
 )
 
 import os
+import gc
 import schedulers
 import numpy as np
 from functools import partial
@@ -156,11 +157,11 @@ def get_model_property(key):
   return model_fn
 
 
-def _train_update(device, step, loss, tracker, epoch, writer):
+def _train_update(device, step, loss_item, tracker, epoch, writer):
   test_utils.print_training_update(
       device,
       step,
-      loss.item(),
+      loss_item,
       tracker.rate(),
       tracker.global_rate(),
       epoch,
@@ -414,8 +415,10 @@ def train_imagenet():
       
       # Log metrics every log_steps (sampled logging for efficiency)
       if step % FLAGS.log_steps == 0:
+        # Detach loss to prevent gradient graph retention
+        loss_item = loss.detach().item()
         xm.add_step_closure(
-            _train_update, args=(device, step, loss, tracker, epoch, writer))
+            _train_update, args=(device, step, loss_item, tracker, epoch, writer))
         
         # WandB logging - logs at same frequency as console output
         if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
@@ -423,7 +426,7 @@ def train_imagenet():
           # Calculate global step across epochs using actual steps per epoch
           global_step = (epoch - 1) * actual_steps_per_epoch + step
           log_dict = {
-              "train/loss": loss.item(),
+              "train/loss": loss_item,
               "train/throughput_samples_per_sec": tracker.rate(),
               "train/global_rate_samples_per_sec": tracker.global_rate(),
               "train/learning_rate": current_lr,
@@ -431,6 +434,8 @@ def train_imagenet():
               "train/step": step,
           }
           wandb.log(log_dict, step=global_step)
+        # Explicitly delete loss tensor to free memory
+        del loss
       if FLAGS.num_steps and FLAGS.num_steps == step:
         break
 
@@ -440,15 +445,18 @@ def train_imagenet():
     for step, (data, target) in enumerate(loader):
       data = data.to(xm.xla_device())
       target = target.to(xm.xla_device())
-      output = model(data)
-      pred = output.max(1, keepdim=True)[1]
-      correct += pred.eq(target.view_as(pred)).sum()
+      with torch.no_grad():  # Disable gradient computation for eval
+        output = model(data)
+        pred = output.max(1, keepdim=True)[1]
+        correct += pred.eq(target.view_as(pred)).sum()
       total_samples += data.size()[0]
       if step % FLAGS.log_steps == 0:
         xm.add_step_closure(
             test_utils.print_test_update, args=(device, None, epoch, step))
       if FLAGS.num_steps and FLAGS.num_steps == step:
         break
+      # Clean up tensors in test loop
+      del data, target, output, pred
     accuracy = 100.0 * correct.item() / total_samples
     return accuracy
 
@@ -457,6 +465,11 @@ def train_imagenet():
     xm.master_print('Epoch {} train begin {}'.format(epoch, test_utils.now()))
     train_loop_fn(train_loader, epoch)
     xm.master_print('Epoch {} train end {}'.format(epoch, test_utils.now()))
+    
+    # Memory cleanup after each epoch to prevent OOM
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    gc.collect()
+    
     if not FLAGS.test_only_at_end or epoch == FLAGS.num_epochs:
       accuracy = test_loop_fn(test_loader, epoch)
       xm.master_print('Epoch {} test end {}, Accuracy={:.2f}'.format(
