@@ -375,9 +375,6 @@ def train_imagenet():
       summary_writer=writer)
   loss_fn = nn.CrossEntropyLoss()
 
-  # Track global step for WandB logging
-  global_step = [0]  # Use list to make it mutable in nested function
-
   def train_loop_fn(loader, epoch):
     tracker = xm.RateTracker()
     model.train()
@@ -412,16 +409,17 @@ def train_imagenet():
         # WandB logging - logs at same frequency as console output
         if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
           current_lr = optimizer.param_groups[0]['lr']
+          # Calculate global step across epochs
+          global_step = (epoch - 1) * num_training_steps_per_epoch + step
           log_dict = {
               "train/loss": loss.item(),
               "train/throughput_samples_per_sec": tracker.rate(),
               "train/global_rate_samples_per_sec": tracker.global_rate(),
               "train/learning_rate": current_lr,
               "train/epoch": epoch,
+              "train/step": step,
           }
-          wandb.log(log_dict, step=global_step[0])
-        
-      global_step[0] += 1
+          wandb.log(log_dict, step=global_step)
       if FLAGS.num_steps and FLAGS.num_steps == step:
         break
 
@@ -461,11 +459,13 @@ def train_imagenet():
       
       # WandB logging for test accuracy
       if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
+        # Log at the end of the epoch
+        global_step = epoch * num_training_steps_per_epoch
         wandb.log({
             "test/accuracy": accuracy,
             "test/max_accuracy": max_accuracy,
             "test/epoch": epoch,
-        }, step=global_step[0])
+        }, step=global_step)
       
     if FLAGS.metrics_debug:
       xm.master_print(met.metrics_report())
