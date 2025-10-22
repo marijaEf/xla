@@ -49,6 +49,17 @@ MODEL_OPTS = {
     },
     '--use_gradient_checkpointing': {
         'action': 'store_true',
+    },
+    '--wandb': {
+        'action': 'store_true',
+    },
+    '--wandb_project': {
+        'type': str,
+        'default': 'xla-imagenet-training',
+    },
+    '--wandb_entity': {
+        'type': str,
+        'default': None,
     }
 }
 
@@ -85,6 +96,13 @@ import torch_xla.core.xla_model as xm
 import torch_xla.debug.profiler as xp
 import torch_xla.test.test_utils as test_utils
 import torch_xla.distributed.spmd as xs
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Install with 'pip install wandb' to enable logging.")
 
 xr.use_spmd(auto=FLAGS.auto_spmd)
 
@@ -293,6 +311,54 @@ def train_imagenet():
   writer = None
   if xm.is_master_ordinal():
     writer = test_utils.get_summary_writer(FLAGS.logdir)
+  
+  # Initialize WandB
+  if FLAGS.wandb and xm.is_master_ordinal():
+    if not WANDB_AVAILABLE:
+      xm.master_print("Warning: WandB logging requested but wandb is not installed. Skipping.")
+    else:
+      wandb_api_key = os.environ.get('WANDB_API_KEY')
+      if wandb_api_key:
+        xm.master_print("WandB API key found in environment")
+        # Login to WandB using the API key
+        try:
+          wandb.login(key=wandb_api_key)
+          xm.master_print("Successfully logged in to WandB")
+        except Exception as e:
+          xm.master_print(f"Warning: Failed to login to WandB: {e}")
+      else:
+        xm.master_print("Warning: WANDB_API_KEY not set. You may need to login with 'wandb login'")
+      
+      num_devices = xr.global_runtime_device_count()
+      
+      wandb.init(
+          project=FLAGS.wandb_project,
+          entity=FLAGS.wandb_entity,
+          name=f"{FLAGS.model}-{num_devices}gpu-spmd",
+          group=FLAGS.model,
+          config={
+              "model": FLAGS.model,
+              "backend": "xla-spmd",
+              "num_devices": num_devices,
+              "batch_size": FLAGS.batch_size,
+              "per_device_batch_size": FLAGS.batch_size // num_devices if num_devices > 1 else FLAGS.batch_size,
+              "learning_rate": FLAGS.lr,
+              "momentum": FLAGS.momentum,
+              "num_epochs": FLAGS.num_epochs,
+              "optimizer": "SGD",
+              "weight_decay": 1e-4,
+              "lr_scheduler_type": getattr(FLAGS, 'lr_scheduler_type', None),
+              "lr_scheduler_divisor": getattr(FLAGS, 'lr_scheduler_divisor', None),
+              "lr_scheduler_divide_every_n_epochs": getattr(FLAGS, 'lr_scheduler_divide_every_n_epochs', None),
+              "sharding": FLAGS.sharding,
+              "use_gradient_checkpointing": FLAGS.use_gradient_checkpointing,
+              "fake_data": FLAGS.fake_data,
+              "num_workers": FLAGS.num_workers,
+              "persistent_workers": FLAGS.persistent_workers,
+          }
+      )
+      xm.master_print(f"WandB logging enabled - Project: {FLAGS.wandb_project}")
+  
   optimizer = optim.SGD(
       model.parameters(),
       lr=FLAGS.lr,
@@ -308,6 +374,9 @@ def train_imagenet():
       num_steps_per_epoch=num_training_steps_per_epoch,
       summary_writer=writer)
   loss_fn = nn.CrossEntropyLoss()
+
+  # Track global step for WandB logging
+  global_step = [0]  # Use list to make it mutable in nested function
 
   def train_loop_fn(loader, epoch):
     tracker = xm.RateTracker()
@@ -334,9 +403,25 @@ def train_imagenet():
       tracker.add(FLAGS.batch_size)
       if lr_scheduler:
         lr_scheduler.step()
+      
+      # Log metrics every log_steps (sampled logging for efficiency)
       if step % FLAGS.log_steps == 0:
         xm.add_step_closure(
             _train_update, args=(device, step, loss, tracker, epoch, writer))
+        
+        # WandB logging - logs at same frequency as console output
+        if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
+          current_lr = optimizer.param_groups[0]['lr']
+          log_dict = {
+              "train/loss": loss.item(),
+              "train/throughput_samples_per_sec": tracker.rate(),
+              "train/global_rate_samples_per_sec": tracker.global_rate(),
+              "train/learning_rate": current_lr,
+              "train/epoch": epoch,
+          }
+          wandb.log(log_dict, step=global_step[0])
+        
+      global_step[0] += 1
       if FLAGS.num_steps and FLAGS.num_steps == step:
         break
 
@@ -373,11 +458,29 @@ def train_imagenet():
           epoch,
           dict_to_write={'Accuracy/test': accuracy},
           write_xla_metrics=True)
+      
+      # WandB logging for test accuracy
+      if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
+        wandb.log({
+            "test/accuracy": accuracy,
+            "test/max_accuracy": max_accuracy,
+            "test/epoch": epoch,
+        }, step=global_step[0])
+      
     if FLAGS.metrics_debug:
       xm.master_print(met.metrics_report())
 
   test_utils.close_summary_writer(writer)
   xm.master_print('Max Accuracy: {:.2f}%'.format(max_accuracy))
+  
+  # Log final metrics to WandB
+  if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
+    wandb.log({
+        "final/max_accuracy": max_accuracy,
+        "final/epochs_completed": FLAGS.num_epochs,
+    })
+    wandb.finish()
+    xm.master_print("WandB logging finished")
   
   return max_accuracy
 
