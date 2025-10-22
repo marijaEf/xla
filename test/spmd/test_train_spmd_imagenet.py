@@ -365,6 +365,14 @@ def train_imagenet():
       momentum=FLAGS.momentum,
       weight_decay=1e-4)
   num_training_steps_per_epoch = train_dataset_len // (FLAGS.batch_size)
+  
+  # If num_steps is specified, use it as the actual steps per epoch for logging
+  # This ensures WandB global_step calculation is continuous without gaps
+  if FLAGS.num_steps:
+    actual_steps_per_epoch = FLAGS.num_steps
+  else:
+    actual_steps_per_epoch = num_training_steps_per_epoch
+  
   lr_scheduler = schedulers.wrap_optimizer_with_scheduler(
       optimizer,
       scheduler_type=getattr(FLAGS, 'lr_scheduler_type', None),
@@ -412,8 +420,8 @@ def train_imagenet():
         # WandB logging - logs at same frequency as console output
         if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
           current_lr = optimizer.param_groups[0]['lr']
-          # Calculate global step across epochs
-          global_step = (epoch - 1) * num_training_steps_per_epoch + step
+          # Calculate global step across epochs using actual steps per epoch
+          global_step = (epoch - 1) * actual_steps_per_epoch + step
           log_dict = {
               "train/loss": loss.item(),
               "train/throughput_samples_per_sec": tracker.rate(),
@@ -462,8 +470,8 @@ def train_imagenet():
       
       # WandB logging for test accuracy
       if FLAGS.wandb and WANDB_AVAILABLE and xm.is_master_ordinal():
-        # Log at the end of the epoch
-        global_step = epoch * num_training_steps_per_epoch
+        # Log at the end of the epoch using actual steps per epoch
+        global_step = epoch * actual_steps_per_epoch
         wandb.log({
             "test/accuracy": accuracy,
             "test/max_accuracy": max_accuracy,
