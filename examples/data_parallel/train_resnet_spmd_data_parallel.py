@@ -32,7 +32,7 @@ class TrainResNetXLASpmdDDP(TrainResNetBase):
     mesh = xs.Mesh(device_ids, mesh_shape, ('data',))
     # scale the batch size with num_devices since there will be only one
     # process that handles all runtime devices.
-    self.batch_size *= num_devices
+    # self.batch_size *= num_devices # Uncomment if you want to scale batch size; currently commented to keep test strong scaling
 
     train_loader = xu.SampleGenerator(
         data=(torch.zeros(self.batch_size, 3, self.img_dim, self.img_dim),
