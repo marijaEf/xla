@@ -65,10 +65,10 @@ class TrainResNetBase():
 
     for epoch in range(1, self.num_epochs + 1):
       xm.master_print('Epoch {} train begin {}'.format(
-          epoch, time.strftime('%l:%M%p %Z on %b %d, %Y')))
+          epoch, time.strftime('%Y-%m-%d %H:%M:%S %Z')))
       self.train_loop_fn(self.train_device_loader, epoch)
       xm.master_print('Epoch {} train end {}'.format(
-          epoch, time.strftime('%l:%M%p %Z on %b %d, %Y')))
+          epoch, time.strftime('%Y-%m-%d %H:%M:%S %Z')))
     xm.wait_device_ops()
 
 
